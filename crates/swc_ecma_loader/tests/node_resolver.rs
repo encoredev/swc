@@ -105,3 +105,22 @@ fn browser_overwrite() {
         );
     });
 }
+
+#[test]
+fn exports() {
+    inside_directory("/tests/exports", || {
+        // Given
+        let node_resolver = NodeModulesResolver::new(TargetEnv::Node, Default::default(), true);
+
+        // When
+        let resolved = node_resolver
+            .resolve(&FileName::Real(PathBuf::from("x.ts")), "sequelize/lib/utils")
+            .expect("should resolve");
+
+        // Expect
+        assert_eq!(
+            resolved,
+            FileName::Real(PathBuf::from("node_modules/sequelize/xx/utils.js"))
+        );
+    });
+}

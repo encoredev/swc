@@ -76,6 +76,8 @@ fn candidate_matches<'a>(candidate: &str, rel_path: &'a str) -> Option<Match<'a>
 
     if let Some(idx) = candidate.find('*') {
         let (prefix, suffix) = candidate.split_at(idx);
+        // Strip the "*" from the suffix.
+        let suffix = &suffix[1..];
         if rel_path.starts_with(prefix) && rel_path.ends_with(suffix) {
             // Get the middle part of the path, to be injected into the result.
             let replacement = &rel_path[prefix.len()..(rel_path.len() - suffix.len())];
