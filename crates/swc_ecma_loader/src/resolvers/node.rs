@@ -183,15 +183,28 @@ impl NodeModulesResolver {
 
         let package_json_path = pkg_dir.join(PACKAGE);
         if !package_json_path.is_file() {
+            if cfg!(debug_assertions) {
+                trace!("package.json not found: {}", package_json_path.display());
+            }
             bail!("package.json not found: {}", package_json_path.display());
         }
 
         let file = File::open(&package_json_path)?;
         let reader = BufReader::new(file);
-        let pkg: PackageJson = serde_json::from_reader(reader)
-            .context(format!("failed to deserialize {}", package_json_path.display()))?;
+        let pkg: PackageJson = match serde_json::from_reader(reader) {
+            Ok(pkg) => pkg,
+            Err(err) => {
+                if cfg!(debug_assertions) {
+                    trace!("failed to parse {}: {:#?}", package_json_path.display(), err);
+                }
+                bail!("failed to parse {}: {}", package_json_path.display(), err);
+            }
+        };
 
         let Some(exports) = &pkg.exports else {
+            if cfg!(debug_assertions) {
+                trace!("no exports field in {}", package_json_path.display());
+            }
             bail!("no exports field in {}", package_json_path.display());
         };
 
@@ -206,7 +219,11 @@ impl NodeModulesResolver {
 
         // The result is relative to the package directory, whereas we want to return an absolute path.
         let result = exports.resolve_import_path(rel_target, &conditions).map(|p| p.to_path_buf());
-        Ok(result.map(|p| pkg_dir.join(p)))
+        let result = result.map(|p| pkg_dir.join(p));
+        if cfg!(debug_assertions) {
+            trace!("import {:?} {:?} yielded path {:?}", pkg_dir, rel_target, result);
+        }
+        Ok(result)
     }
 
     /// Resolve a path as a file. If `path` refers to a file, it is returned;
