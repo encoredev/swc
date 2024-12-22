@@ -3,12 +3,12 @@
 //! See: https://github.com/goto-bus-stop/node-resolve
 
 use std::{
+    collections::HashSet,
     env::current_dir,
     fs::File,
     io::BufReader,
     path::{Component, Path, PathBuf},
 };
-use std::collections::HashSet;
 
 use anyhow::{bail, Context, Error};
 use dashmap::DashMap;
@@ -24,8 +24,7 @@ use swc_common::{
 };
 use tracing::{debug, trace, Level};
 
-use crate::{resolve::Resolve, TargetEnv, NODE_BUILTINS};
-use crate::resolvers::exports::Exports;
+use crate::{resolve::Resolve, resolvers::exports::Exports, TargetEnv, NODE_BUILTINS};
 
 static PACKAGE: &str = "package.json";
 
@@ -101,7 +100,6 @@ enum StringOrBool {
     Bool(bool),
 }
 
-
 #[derive(Debug, Default)]
 pub struct NodeModulesResolver {
     target_env: TargetEnv,
@@ -171,12 +169,9 @@ impl NodeModulesResolver {
         bail!("index not found")
     }
 
-    /// Resolve a path from the "exports" directive in the package.json file, if present.
-    fn resolve_export(
-        &self,
-        pkg_dir: &Path,
-        rel_target: &str,
-    ) -> Result<Option<PathBuf>, Error> {
+    /// Resolve a path from the "exports" directive in the package.json file, if
+    /// present.
+    fn resolve_export(&self, pkg_dir: &Path, rel_target: &str) -> Result<Option<PathBuf>, Error> {
         if cfg!(debug_assertions) {
             trace!("resolve_export({:?}, {:?})", pkg_dir, rel_target);
         }
@@ -195,7 +190,11 @@ impl NodeModulesResolver {
             Ok(pkg) => pkg,
             Err(err) => {
                 if cfg!(debug_assertions) {
-                    trace!("failed to parse {}: {:#?}", package_json_path.display(), err);
+                    trace!(
+                        "failed to parse {}: {:#?}",
+                        package_json_path.display(),
+                        err
+                    );
                 }
                 bail!("failed to parse {}: {}", package_json_path.display(), err);
             }
@@ -208,20 +207,29 @@ impl NodeModulesResolver {
             bail!("no exports field in {}", package_json_path.display());
         };
 
-        let mut conditions = HashSet::from_iter(self.extra_export_conditions.iter().map(|s| s.as_str()));
+        let mut conditions =
+            HashSet::from_iter(self.extra_export_conditions.iter().map(|s| s.as_str()));
         conditions.extend({
-            let slice : &[_] = match self.target_env {
+            let slice: &[_] = match self.target_env {
                 TargetEnv::Node => &["node-addons", "node", "import", "require", "default"],
                 TargetEnv::Browser => &["browser", "import", "default"],
             };
             slice
         });
 
-        // The result is relative to the package directory, whereas we want to return an absolute path.
-        let result = exports.resolve_import_path(rel_target, &conditions).map(|p| p.to_path_buf());
+        // The result is relative to the package directory, whereas we want to return an
+        // absolute path.
+        let result = exports
+            .resolve_import_path(rel_target, &conditions)
+            .map(|p| p.to_path_buf());
         let result = result.map(|p| pkg_dir.join(p));
         if cfg!(debug_assertions) {
-            trace!("import {:?} {:?} yielded path {:?}", pkg_dir, rel_target, result);
+            trace!(
+                "import {:?} {:?} yielded path {:?}",
+                pkg_dir,
+                rel_target,
+                result
+            );
         }
         Ok(result)
     }
@@ -303,7 +311,6 @@ impl NodeModulesResolver {
 
         bail!("file not found: {}", path.display())
     }
-
 
     /// Resolve a path as a directory, using the "main" key from a package.json
     /// file if it exists, or resolving to the index.EXT file if it exists.
@@ -468,21 +475,23 @@ impl NodeModulesResolver {
             return Ok(None);
         }
 
+        let (pkg_name, pkg_rel_path) = self.pkg_name_from_target(target);
         let absolute_path = to_absolute_path(base_dir)?;
         let mut path = Some(&*absolute_path);
         while let Some(dir) = path {
             let node_modules = dir.join("node_modules");
             if node_modules.is_dir() {
-                let (pkg_name, pkg_path) = self.pkg_name_from_target(target);
                 let path = node_modules.join(target);
                 let pkg_dir = node_modules.join(pkg_name);
-                if let Some(result) = self
-                    .resolve_export(&pkg_dir, pkg_path).ok()
-                    .or_else(|| self.resolve_as_file(&path).ok())
-                    .or_else(|| self.resolve_as_directory(&path, true).ok())
-                    .flatten()
-                {
-                    return Ok(Some(result));
+
+                let result = match self.resolve_export(&pkg_dir, pkg_rel_path) {
+                    Ok(Some(path)) => self.resolve_as_file(&path),
+                    Ok(None) | Err(_) => self
+                        .resolve_as_file(&path)
+                        .or_else(|_| self.resolve_as_directory(&path, true)),
+                };
+                if let Ok(Some(path)) = result {
+                    return Ok(Some(path));
                 }
             }
             path = dir.parent();
@@ -512,7 +521,7 @@ impl NodeModulesResolver {
                 } else {
                     (&target[..idx], &target[(idx + 1)..])
                 }
-            },
+            }
         }
     }
 }
