@@ -492,9 +492,9 @@ impl NodeModulesResolver {
                 let path = node_modules.join(target);
                 let pkg_dir = node_modules.join(pkg_name);
 
-                let result = match self.resolve_export(&pkg_dir, pkg_rel_path)? {
-                    Some(path) => self.resolve_as_file(&path),
-                    None => self
+                let result = match self.resolve_export(&pkg_dir, pkg_rel_path) {
+                    Ok(Some(path)) => self.resolve_as_file(&path),
+                    Ok(None) | Err(_) => self
                         .resolve_as_file(&path)
                         .or_else(|_| self.resolve_as_directory(&path, true)),
                 };
