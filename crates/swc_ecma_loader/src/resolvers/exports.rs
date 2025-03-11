@@ -8,22 +8,26 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 /// See https://nodejs.org/api/packages.html#package-entry-points for syntax.
 #[derive(Debug)]
 pub(super) struct Exports {
-    subpaths: BTreeMap<String, Subpath>
+    subpaths: BTreeMap<String, Subpath>,
 }
 
 impl Exports {
     /// Resolves a relative path to a target file path.
-    pub fn resolve_import_path(&self, rel_path: &str, conditions: &HashSet<&str>) -> Option<PathBuf> {
+    pub fn resolve_import_path(
+        &self,
+        rel_path: &str,
+        conditions: &HashSet<&str>,
+    ) -> Option<Vec<PathBuf>> {
         let mut wildcard_match = None;
         for (candidate, subpath) in self.subpaths.iter() {
             match candidate_matches(candidate, rel_path) {
                 None => continue,
                 Some(Match::Exact) => {
-                    return subpath.matches(&conditions).and_then(|m| {
-                        match m {
-                            SubpathMatch::Target(path) => Some(path.into()),
-                            SubpathMatch::Exclude => None,
+                    return subpath.matches(&conditions).and_then(|m| match m {
+                        SubpathMatch::Targets(paths) => {
+                            Some(paths.into_iter().map(|path| path.into()).collect())
                         }
+                        SubpathMatch::Exclude => None,
                     });
                 }
                 Some(Match::Wildcard { replacement }) => {
@@ -32,9 +36,9 @@ impl Exports {
 
                         // If we have a target, save it as a candidate.
                         // We have to keep looking as there may be an exclude directive later.
-                        Some(SubpathMatch::Target(path)) => {
+                        Some(SubpathMatch::Targets(paths)) => {
                             if wildcard_match.is_none() {
-                                wildcard_match = Some((path, replacement));
+                                wildcard_match = Some((paths, replacement));
                             }
                         }
 
@@ -47,13 +51,15 @@ impl Exports {
 
         match wildcard_match {
             None => None,
-            Some((path, replacement)) => {
-                Some(path.replace("*", replacement).into())
-            }
+            Some((paths, replacement)) => Some(
+                paths
+                    .into_iter()
+                    .map(|path| path.replace("*", replacement).into())
+                    .collect(),
+            ),
         }
     }
 }
-
 
 enum Match<'a> {
     Exact,
@@ -81,7 +87,7 @@ fn candidate_matches<'a>(candidate: &str, rel_path: &'a str) -> Option<Match<'a>
         if rel_path.starts_with(prefix) && rel_path.ends_with(suffix) {
             // Get the middle part of the path, to be injected into the result.
             let replacement = &rel_path[prefix.len()..(rel_path.len() - suffix.len())];
-            return Some(Match::Wildcard { replacement })
+            return Some(Match::Wildcard { replacement });
         }
     }
 
@@ -90,20 +96,22 @@ fn candidate_matches<'a>(candidate: &str, rel_path: &'a str) -> Option<Match<'a>
 
 #[derive(Debug, PartialEq, Eq)]
 enum Subpath {
-    Target(String),
+    Targets(Vec<String>),
     Conditions(BTreeMap<String, Subpath>),
     Exclude,
 }
 
 enum SubpathMatch<'a> {
-    Target(&'a str),
+    Targets(Vec<&'a str>),
     Exclude,
 }
 
 impl Subpath {
     fn matches(&self, active_conditions: &HashSet<&str>) -> Option<SubpathMatch> {
         match self {
-            Subpath::Target(path) => Some(SubpathMatch::Target(&path)),
+            Subpath::Targets(paths) => Some(SubpathMatch::Targets(
+                paths.iter().map(|path| path.as_str()).collect(),
+            )),
             Subpath::Exclude => Some(SubpathMatch::Exclude),
             Subpath::Conditions(conds) => {
                 for (cond, subpath) in conds.iter() {
@@ -128,12 +136,14 @@ impl Subpath {
 // - An ordered map of subpaths key-value pairs: {".": "./index.js", "./foo/*": "./foo/*.js"}
 // - Each subpath value can be one of:
 //   - A single target path, e.g. "./index.js" (possibly with wildcards, "./foo/*.js")
+//   - An array of target paths
 //   - A condition spec.
 //   - Null, indicating the subpath is not exported (overriding other exports that may match).
 
 impl<'de> Deserialize<'de> for Exports {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where D: Deserializer<'de>
+    where
+        D: Deserializer<'de>,
     {
         struct StringOrMap;
         impl<'de> Visitor<'de> for StringOrMap {
@@ -144,19 +154,31 @@ impl<'de> Deserialize<'de> for Exports {
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-                where
-                    E: de::Error,
+            where
+                E: de::Error,
             {
-                let mut subpaths =  BTreeMap::<String, Subpath>::new();
-                subpaths.insert(".".into(), Subpath::Target(value.to_string()));
+                let mut subpaths = BTreeMap::<String, Subpath>::new();
+                subpaths.insert(".".into(), Subpath::Targets(vec![value.to_string()]));
+                Ok(Exports { subpaths })
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut subpaths = BTreeMap::<String, Subpath>::new();
+
+                let targets: Vec<String> =
+                    Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
+
+                subpaths.insert(".".into(), Subpath::Targets(targets));
                 Ok(Exports { subpaths })
             }
 
             fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
-                where
-                    M: MapAccess<'de>,
+            where
+                M: MapAccess<'de>,
             {
-
                 let mut subpaths = BTreeMap::new();
 
                 // Peek at the first entry to decide whether it's a map of subpaths or conditions.
@@ -166,7 +188,8 @@ impl<'de> Deserialize<'de> for Exports {
                 };
 
                 if !key.starts_with(".") {
-                    let mut conditions: BTreeMap<String, Subpath> = Deserialize::deserialize(de::value::MapAccessDeserializer::new(access))?;
+                    let mut conditions: BTreeMap<String, Subpath> =
+                        Deserialize::deserialize(de::value::MapAccessDeserializer::new(access))?;
                     conditions.insert(key, value);
                     subpaths.insert(".".to_string(), Subpath::Conditions(conditions));
                     return Ok(Exports { subpaths });
@@ -191,32 +214,46 @@ impl<'de> Visitor<'de> for SubpathVisitor {
     type Value = Subpath;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("string or map")
+        formatter.write_str("string, map or sequence")
     }
 
-    fn visit_unit<E>(self) -> Result<Self::Value, E> where E: de::Error {
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
         Ok(Subpath::Exclude)
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
+    where
+        E: de::Error,
     {
-        Ok(Subpath::Target(value.to_string()))
+        Ok(Subpath::Targets(vec![value.to_string()]))
     }
 
     fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
-        where
-            M: MapAccess<'de>,
+    where
+        M: MapAccess<'de>,
     {
-        let conditions: BTreeMap<String, Subpath> = Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
+        let conditions: BTreeMap<String, Subpath> =
+            Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
         Ok(Subpath::Conditions(conditions))
+    }
+
+    fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let targets: Vec<String> =
+            Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
+        Ok(Subpath::Targets(targets))
     }
 }
 
 impl<'de> Deserialize<'de> for Subpath {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where D: Deserializer<'de>
+    where
+        D: Deserializer<'de>,
     {
         deserializer.deserialize_any(SubpathVisitor)
     }
@@ -228,48 +265,72 @@ mod tests {
 
     #[test]
     fn parse_subpaths() {
-        let exports: Exports = serde_json::from_str(r#"{
+        let exports: Exports = serde_json::from_str(
+            r#"{
             ".": "./index.js",
             "./foo/*": "./foo/*.js",
             "./bar": {"node": "./bar.node.js", "default": "./bar.js"},
             "./baz": {"node": "./baz.node.js", "default": null},
             "./qux": null
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(exports.subpaths.len(), 5);
-        assert_eq!(exports.subpaths.get(".").unwrap(), &Subpath::Target("./index.js".into()));
-        assert_eq!(exports.subpaths.get("./foo/*").unwrap(), &Subpath::Target("./foo/*.js".into()));
-        assert_eq!(exports.subpaths.get("./bar").unwrap(), &Subpath::Conditions({
-            let mut map = BTreeMap::new();
-            map.insert("node".to_owned(), Subpath::Target("./bar.node.js".into()));
-            map.insert("default".to_owned(), Subpath::Target("./bar.js".into()));
-            map
-        }));
-        assert_eq!(exports.subpaths.get("./baz").unwrap(), &Subpath::Conditions({
-            let mut map = BTreeMap::new();
-            map.insert("node".to_owned(), Subpath::Target("./baz.node.js".into()));
-            map.insert("default".to_owned(), Subpath::Exclude);
-            map
-        }));
+        assert_eq!(
+            exports.subpaths.get(".").unwrap(),
+            &Subpath::Target("./index.js".into())
+        );
+        assert_eq!(
+            exports.subpaths.get("./foo/*").unwrap(),
+            &Subpath::Target("./foo/*.js".into())
+        );
+        assert_eq!(
+            exports.subpaths.get("./bar").unwrap(),
+            &Subpath::Conditions({
+                let mut map = BTreeMap::new();
+                map.insert("node".to_owned(), Subpath::Target("./bar.node.js".into()));
+                map.insert("default".to_owned(), Subpath::Target("./bar.js".into()));
+                map
+            })
+        );
+        assert_eq!(
+            exports.subpaths.get("./baz").unwrap(),
+            &Subpath::Conditions({
+                let mut map = BTreeMap::new();
+                map.insert("node".to_owned(), Subpath::Target("./baz.node.js".into()));
+                map.insert("default".to_owned(), Subpath::Exclude);
+                map
+            })
+        );
         assert_eq!(exports.subpaths.get("./qux").unwrap(), &Subpath::Exclude);
     }
 
     #[test]
     fn parse_toplevel_conditions() {
-        let exports: Exports = serde_json::from_str(r#"{
+        let exports: Exports = serde_json::from_str(
+            r#"{
             "node": {"import": "./bar.node.js", "default": "./bar.js"},
             "default": "./index.js"
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(exports.subpaths.len(), 1);
-        assert_eq!(exports.subpaths.get(".").unwrap(), &Subpath::Conditions({
-            let mut map = BTreeMap::new();
-            map.insert("node".to_owned(), Subpath::Conditions({
+        assert_eq!(
+            exports.subpaths.get(".").unwrap(),
+            &Subpath::Conditions({
                 let mut map = BTreeMap::new();
-                map.insert("import".to_owned(), Subpath::Target("./bar.node.js".into()));
-                map.insert("default".to_owned(), Subpath::Target("./bar.js".into()));
+                map.insert(
+                    "node".to_owned(),
+                    Subpath::Conditions({
+                        let mut map = BTreeMap::new();
+                        map.insert("import".to_owned(), Subpath::Target("./bar.node.js".into()));
+                        map.insert("default".to_owned(), Subpath::Target("./bar.js".into()));
+                        map
+                    }),
+                );
+                map.insert("default".to_owned(), Subpath::Target("./index.js".into()));
                 map
-            }));
-            map.insert("default".to_owned(), Subpath::Target("./index.js".into()));
-            map
-        }));
+            })
+        );
     }
 }
