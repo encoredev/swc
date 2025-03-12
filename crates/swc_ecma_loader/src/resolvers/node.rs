@@ -5,7 +5,7 @@
 use std::{
     collections::HashSet,
     env::current_dir,
-    fs::File,
+    fs::{self, File},
     io::BufReader,
     path::{Component, Path, PathBuf},
 };
@@ -219,10 +219,18 @@ impl NodeModulesResolver {
 
         // The result is relative to the package directory, whereas we want to return an
         // absolute path.
-        let result = exports
+        let result: Option<Vec<_>> = exports
             .resolve_import_path(rel_target, &conditions)
-            .map(|p| p.to_path_buf());
-        let result = result.map(|p| pkg_dir.join(p));
+            .map(|p| p.into_iter().map(|p| pkg_dir.join(p)).collect());
+
+        let result = result
+            .map(|paths| {
+                paths
+                    .into_iter()
+                    .find(|p| matches!(fs::exists(p), Ok(true)))
+            })
+            .flatten();
+
         if cfg!(debug_assertions) {
             trace!(
                 "import {:?} {:?} yielded path {:?}",
