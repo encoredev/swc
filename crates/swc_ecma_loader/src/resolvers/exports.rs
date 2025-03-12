@@ -25,7 +25,7 @@ impl Exports {
                 Some(Match::Exact) => {
                     return subpath.matches(&conditions).and_then(|m| match m {
                         SubpathMatch::Targets(paths) => {
-                            Some(paths.into_iter().map(|path| path.into()).collect())
+                            Some(paths.iter().map(|path| path.into()).collect())
                         }
                         SubpathMatch::Exclude => None,
                     });
@@ -102,16 +102,14 @@ enum Subpath {
 }
 
 enum SubpathMatch<'a> {
-    Targets(Vec<&'a str>),
+    Targets(&'a [String]),
     Exclude,
 }
 
 impl Subpath {
     fn matches(&self, active_conditions: &HashSet<&str>) -> Option<SubpathMatch> {
         match self {
-            Subpath::Targets(paths) => Some(SubpathMatch::Targets(
-                paths.iter().map(|path| path.as_str()).collect(),
-            )),
+            Subpath::Targets(paths) => Some(SubpathMatch::Targets(paths.as_slice())),
             Subpath::Exclude => Some(SubpathMatch::Exclude),
             Subpath::Conditions(conds) => {
                 for (cond, subpath) in conds.iter() {
