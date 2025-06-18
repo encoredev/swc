@@ -1,14 +1,15 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 
+use indexmap::IndexMap;
 use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 
 /// The parsed representation of the "exports" field in a package.json file.
 /// See https://nodejs.org/api/packages.html#package-entry-points for syntax.
 #[derive(Debug)]
 pub(super) struct Exports {
-    subpaths: BTreeMap<String, Subpath>,
+    subpaths: IndexMap<String, Subpath>,
 }
 
 impl Exports {
@@ -97,7 +98,7 @@ fn candidate_matches<'a>(candidate: &str, rel_path: &'a str) -> Option<Match<'a>
 #[derive(Debug, PartialEq, Eq)]
 enum Subpath {
     Targets(Vec<String>),
-    Conditions(BTreeMap<String, Subpath>),
+    Conditions(IndexMap<String, Subpath>),
     Exclude,
 }
 
@@ -155,7 +156,7 @@ impl<'de> Deserialize<'de> for Exports {
             where
                 E: de::Error,
             {
-                let mut subpaths = BTreeMap::<String, Subpath>::new();
+                let mut subpaths = IndexMap::<String, Subpath>::new();
                 subpaths.insert(".".into(), Subpath::Targets(vec![value.to_string()]));
                 Ok(Exports { subpaths })
             }
@@ -164,7 +165,7 @@ impl<'de> Deserialize<'de> for Exports {
             where
                 A: de::SeqAccess<'de>,
             {
-                let mut subpaths = BTreeMap::<String, Subpath>::new();
+                let mut subpaths = IndexMap::<String, Subpath>::new();
 
                 let targets: Vec<String> =
                     Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
@@ -177,7 +178,7 @@ impl<'de> Deserialize<'de> for Exports {
             where
                 M: MapAccess<'de>,
             {
-                let mut subpaths = BTreeMap::new();
+                let mut subpaths = IndexMap::new();
 
                 // Peek at the first entry to decide whether it's a map of subpaths or conditions.
                 let Some((key, value)) = access.next_entry::<String, Subpath>()? else {
@@ -186,7 +187,7 @@ impl<'de> Deserialize<'de> for Exports {
                 };
 
                 if !key.starts_with(".") {
-                    let mut conditions: BTreeMap<String, Subpath> =
+                    let mut conditions: IndexMap<String, Subpath> =
                         Deserialize::deserialize(de::value::MapAccessDeserializer::new(access))?;
                     conditions.insert(key, value);
                     subpaths.insert(".".to_string(), Subpath::Conditions(conditions));
@@ -233,7 +234,7 @@ impl<'de> Visitor<'de> for SubpathVisitor {
     where
         M: MapAccess<'de>,
     {
-        let conditions: BTreeMap<String, Subpath> =
+        let conditions: IndexMap<String, Subpath> =
             Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
         Ok(Subpath::Conditions(conditions))
     }
@@ -285,7 +286,7 @@ mod tests {
         assert_eq!(
             exports.subpaths.get("./bar").unwrap(),
             &Subpath::Conditions({
-                let mut map = BTreeMap::new();
+                let mut map = IndexMap::new();
                 map.insert("node".to_owned(), Subpath::Target("./bar.node.js".into()));
                 map.insert("default".to_owned(), Subpath::Target("./bar.js".into()));
                 map
@@ -294,7 +295,7 @@ mod tests {
         assert_eq!(
             exports.subpaths.get("./baz").unwrap(),
             &Subpath::Conditions({
-                let mut map = BTreeMap::new();
+                let mut map = IndexMap::new();
                 map.insert("node".to_owned(), Subpath::Target("./baz.node.js".into()));
                 map.insert("default".to_owned(), Subpath::Exclude);
                 map
@@ -316,11 +317,11 @@ mod tests {
         assert_eq!(
             exports.subpaths.get(".").unwrap(),
             &Subpath::Conditions({
-                let mut map = BTreeMap::new();
+                let mut map = IndexMap::new();
                 map.insert(
                     "node".to_owned(),
                     Subpath::Conditions({
-                        let mut map = BTreeMap::new();
+                        let mut map = IndexMap::new();
                         map.insert("import".to_owned(), Subpath::Target("./bar.node.js".into()));
                         map.insert("default".to_owned(), Subpath::Target("./bar.js".into()));
                         map
