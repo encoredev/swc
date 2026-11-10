@@ -115,7 +115,8 @@ impl Subpath {
     /// Like TypeScript, a matching condition doesn't end the search: the targets of
     /// later matching conditions are kept as fallbacks, in object order. So when a
     /// "types" target doesn't exist on disk, the "import" target is tried next.
-    /// A null target (exclude) ends the search.
+    /// A null under a condition gives no target, at any nesting level; only a
+    /// subpath that maps directly to null is excluded.
     fn matches(&self, active_conditions: &HashSet<&str>) -> Option<SubpathMatch<'_>> {
         match self {
             Subpath::Targets(paths) => Some(SubpathMatch::Targets(
@@ -128,14 +129,10 @@ impl Subpath {
                     if !active_conditions.contains(cond.as_str()) {
                         continue;
                     }
-                    match subpath.matches(active_conditions) {
-                        // Nested conditions with no match: try the next condition.
-                        None => continue,
-                        Some(SubpathMatch::Targets(paths)) => targets.extend(paths),
-                        Some(SubpathMatch::Exclude) if targets.is_empty() => {
-                            return Some(SubpathMatch::Exclude)
-                        }
-                        Some(SubpathMatch::Exclude) => break,
+                    // A null target, or nested conditions with no match, gives
+                    // nothing: try the next condition.
+                    if let Some(SubpathMatch::Targets(paths)) = subpath.matches(active_conditions) {
+                        targets.extend(paths);
                     }
                 }
                 if targets.is_empty() {
@@ -449,25 +446,61 @@ mod tests {
     }
 
     #[test]
-    fn null_target_ends_search() {
-        // A null target as the first match excludes the subpath.
+    fn null_subpath_is_excluded() {
+        let exports = r#"{
+            "./*": "./dist/*.js",
+            "./internal/*": null
+        }"#;
+
+        assert_eq!(resolve(exports, "internal/foo", &["default"]), None);
+        assert_eq!(
+            resolve(exports, "foo", &["default"]),
+            paths(&["./dist/foo.js"])
+        );
+        assert_eq!(resolve(r#"{"./foo": null}"#, "foo", &["default"]), None);
+    }
+
+    #[test]
+    fn null_condition_is_skipped() {
+        // Like TypeScript, a null under a condition gives no candidate and the search
+        // goes on, at every nesting level.
         assert_eq!(
             resolve(
                 r#"{"./internal/*": {"node": null, "default": "./internal/*.js"}}"#,
                 "internal/foo",
                 &["node", "default"]
             ),
-            None
+            paths(&["./internal/foo.js"])
         );
-
-        // A null target after a match drops the later fallbacks.
         assert_eq!(
             resolve(
                 r#"{"types": "./index.d.ts", "node": null, "default": "./index.js"}"#,
                 "",
                 &["types", "node", "default"]
             ),
-            paths(&["./index.d.ts"])
+            paths(&["./index.d.ts", "./index.js"])
         );
+        assert_eq!(
+            resolve(
+                r#"{
+                    "outer": {"first": "./missing.js", "second": null},
+                    "default": "./fallback.js"
+                }"#,
+                "",
+                &["outer", "first", "second", "default"]
+            ),
+            paths(&["./missing.js", "./fallback.js"])
+        );
+        assert_eq!(
+            resolve(
+                r#"{"outer": {"second": null}, "default": "./fallback.js"}"#,
+                "",
+                &["outer", "second", "default"]
+            ),
+            paths(&["./fallback.js"])
+        );
+
+        // Only nulls under the active conditions: nothing to resolve.
+        assert_eq!(resolve(r#"{"node": null}"#, "", &["node", "default"]), None);
     }
 }
