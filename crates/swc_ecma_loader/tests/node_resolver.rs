@@ -124,3 +124,63 @@ fn exports() {
         );
     });
 }
+
+#[test]
+fn exports_types_condition_falls_back() {
+    inside_directory("/tests/exports_types_fallback", || {
+        // Given
+        let node_resolver = NodeModulesResolver::with_export_conditions(
+            TargetEnv::Node,
+            Default::default(),
+            true,
+            vec!["types".into()],
+        );
+
+        // When: "./*" maps the "types" condition to "./dist/esm/*.d.ts", which for
+        // "server/mcp.js" gives "dist/esm/server/mcp.js.d.ts". That file doesn't exist, so
+        // resolution falls back to the "import" condition.
+        let resolved = node_resolver
+            .resolve(
+                &FileName::Real(PathBuf::from("x.ts")),
+                "@modelcontextprotocol/sdk/server/mcp.js",
+            )
+            .expect("should resolve");
+
+        // Expect
+        assert_eq!(
+            resolved,
+            FileName::Real(PathBuf::from(
+                "node_modules/@modelcontextprotocol/sdk/dist/esm/server/mcp.js"
+            ))
+        );
+    });
+}
+
+#[test]
+fn exports_types_condition_preferred_when_present() {
+    inside_directory("/tests/exports_types_fallback", || {
+        // Given
+        let node_resolver = NodeModulesResolver::with_export_conditions(
+            TargetEnv::Node,
+            Default::default(),
+            true,
+            vec!["types".into()],
+        );
+
+        // When: the "types" target "dist/esm/server/mcp.d.ts" exists, so it wins.
+        let resolved = node_resolver
+            .resolve(
+                &FileName::Real(PathBuf::from("x.ts")),
+                "@modelcontextprotocol/sdk/server/mcp",
+            )
+            .expect("should resolve");
+
+        // Expect
+        assert_eq!(
+            resolved,
+            FileName::Real(PathBuf::from(
+                "node_modules/@modelcontextprotocol/sdk/dist/esm/server/mcp.d.ts"
+            ))
+        );
+    });
+}

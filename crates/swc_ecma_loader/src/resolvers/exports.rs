@@ -13,7 +13,8 @@ pub(super) struct Exports {
 }
 
 impl Exports {
-    /// Resolves a relative path to a target file path.
+    /// Resolves a relative path to candidate target file paths, in priority order.
+    /// The caller should use the first candidate that exists.
     pub fn resolve_import_path(
         &self,
         rel_path: &str,
@@ -26,7 +27,7 @@ impl Exports {
                 Some(Match::Exact) => {
                     return subpath.matches(&conditions).and_then(|m| match m {
                         SubpathMatch::Targets(paths) => {
-                            Some(paths.iter().map(|path| path.into()).collect())
+                            Some(paths.into_iter().map(PathBuf::from).collect())
                         }
                         SubpathMatch::Exclude => None,
                     });
@@ -103,22 +104,45 @@ enum Subpath {
 }
 
 enum SubpathMatch<'a> {
-    Targets(&'a [String]),
+    /// Candidate targets, in priority order. The first one that exists wins.
+    Targets(Vec<&'a str>),
     Exclude,
 }
 
 impl Subpath {
-    fn matches(&self, active_conditions: &HashSet<&str>) -> Option<SubpathMatch> {
+    /// Returns the targets this subpath maps to under the active conditions.
+    ///
+    /// Like TypeScript, a matching condition doesn't end the search: the targets of
+    /// later matching conditions are kept as fallbacks, in object order. So when a
+    /// "types" target doesn't exist on disk, the "import" target is tried next.
+    /// A null target (exclude) ends the search.
+    fn matches(&self, active_conditions: &HashSet<&str>) -> Option<SubpathMatch<'_>> {
         match self {
-            Subpath::Targets(paths) => Some(SubpathMatch::Targets(paths.as_slice())),
+            Subpath::Targets(paths) => Some(SubpathMatch::Targets(
+                paths.iter().map(String::as_str).collect(),
+            )),
             Subpath::Exclude => Some(SubpathMatch::Exclude),
             Subpath::Conditions(conds) => {
+                let mut targets = Vec::new();
                 for (cond, subpath) in conds.iter() {
-                    if active_conditions.contains(cond.as_str()) {
-                        return subpath.matches(&active_conditions);
+                    if !active_conditions.contains(cond.as_str()) {
+                        continue;
+                    }
+                    match subpath.matches(active_conditions) {
+                        // Nested conditions with no match: try the next condition.
+                        None => continue,
+                        Some(SubpathMatch::Targets(paths)) => targets.extend(paths),
+                        Some(SubpathMatch::Exclude) if targets.is_empty() => {
+                            return Some(SubpathMatch::Exclude)
+                        }
+                        Some(SubpathMatch::Exclude) => break,
                     }
                 }
-                None
+                if targets.is_empty() {
+                    None
+                } else {
+                    Some(SubpathMatch::Targets(targets))
+                }
             }
         }
     }
@@ -187,9 +211,12 @@ impl<'de> Deserialize<'de> for Exports {
                 };
 
                 if !key.starts_with(".") {
-                    let mut conditions: IndexMap<String, Subpath> =
-                        Deserialize::deserialize(de::value::MapAccessDeserializer::new(access))?;
+                    // Keep the peeked condition first: condition order is priority order.
+                    let mut conditions = IndexMap::new();
                     conditions.insert(key, value);
+                    let rest: IndexMap<String, Subpath> =
+                        Deserialize::deserialize(de::value::MapAccessDeserializer::new(access))?;
+                    conditions.extend(rest);
                     subpaths.insert(".".to_string(), Subpath::Conditions(conditions));
                     return Ok(Exports { subpaths });
                 }
@@ -277,18 +304,24 @@ mod tests {
         assert_eq!(exports.subpaths.len(), 5);
         assert_eq!(
             exports.subpaths.get(".").unwrap(),
-            &Subpath::Target("./index.js".into())
+            &Subpath::Targets(vec!["./index.js".into()])
         );
         assert_eq!(
             exports.subpaths.get("./foo/*").unwrap(),
-            &Subpath::Target("./foo/*.js".into())
+            &Subpath::Targets(vec!["./foo/*.js".into()])
         );
         assert_eq!(
             exports.subpaths.get("./bar").unwrap(),
             &Subpath::Conditions({
                 let mut map = IndexMap::new();
-                map.insert("node".to_owned(), Subpath::Target("./bar.node.js".into()));
-                map.insert("default".to_owned(), Subpath::Target("./bar.js".into()));
+                map.insert(
+                    "node".to_owned(),
+                    Subpath::Targets(vec!["./bar.node.js".into()]),
+                );
+                map.insert(
+                    "default".to_owned(),
+                    Subpath::Targets(vec!["./bar.js".into()]),
+                );
                 map
             })
         );
@@ -296,7 +329,10 @@ mod tests {
             exports.subpaths.get("./baz").unwrap(),
             &Subpath::Conditions({
                 let mut map = IndexMap::new();
-                map.insert("node".to_owned(), Subpath::Target("./baz.node.js".into()));
+                map.insert(
+                    "node".to_owned(),
+                    Subpath::Targets(vec!["./baz.node.js".into()]),
+                );
                 map.insert("default".to_owned(), Subpath::Exclude);
                 map
             })
@@ -322,14 +358,116 @@ mod tests {
                     "node".to_owned(),
                     Subpath::Conditions({
                         let mut map = IndexMap::new();
-                        map.insert("import".to_owned(), Subpath::Target("./bar.node.js".into()));
-                        map.insert("default".to_owned(), Subpath::Target("./bar.js".into()));
+                        map.insert(
+                            "import".to_owned(),
+                            Subpath::Targets(vec!["./bar.node.js".into()]),
+                        );
+                        map.insert(
+                            "default".to_owned(),
+                            Subpath::Targets(vec!["./bar.js".into()]),
+                        );
                         map
                     }),
                 );
-                map.insert("default".to_owned(), Subpath::Target("./index.js".into()));
+                map.insert(
+                    "default".to_owned(),
+                    Subpath::Targets(vec!["./index.js".into()]),
+                );
                 map
             })
+        );
+    }
+
+    fn resolve(exports: &str, rel_path: &str, conditions: &[&str]) -> Option<Vec<PathBuf>> {
+        let exports: Exports = serde_json::from_str(exports).unwrap();
+        let conditions: HashSet<&str> = conditions.iter().copied().collect();
+        exports.resolve_import_path(rel_path, &conditions)
+    }
+
+    fn paths(paths: &[&str]) -> Option<Vec<PathBuf>> {
+        Some(paths.iter().map(PathBuf::from).collect())
+    }
+
+    #[test]
+    fn condition_order() {
+        let exports = r#"{
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.mjs",
+            "default": "./dist/index.js"
+        }"#;
+
+        // Object order decides priority, not the order of the active conditions.
+        assert_eq!(
+            resolve(exports, "", &["default", "import", "types"]),
+            paths(&["./dist/index.d.ts", "./dist/index.mjs", "./dist/index.js"])
+        );
+        assert_eq!(
+            resolve(exports, "", &["import", "default"]),
+            paths(&["./dist/index.mjs", "./dist/index.js"])
+        );
+    }
+
+    #[test]
+    fn wildcard_types_falls_back_to_import() {
+        // The "./*" entry of @modelcontextprotocol/sdk >= 1.29.0. For "server/mcp.js" the
+        // "types" target is "dist/esm/server/mcp.js.d.ts", which doesn't exist, so the
+        // "import" target must remain a candidate.
+        let exports = r#"{
+            ".": {
+                "types": "./dist/esm/index.d.ts",
+                "import": "./dist/esm/index.js",
+                "require": "./dist/cjs/index.js"
+            },
+            "./*": {
+                "types": "./dist/esm/*.d.ts",
+                "import": "./dist/esm/*",
+                "require": "./dist/cjs/*"
+            }
+        }"#;
+
+        assert_eq!(
+            resolve(exports, "server/mcp.js", &["types", "import", "require"]),
+            paths(&[
+                "./dist/esm/server/mcp.js.d.ts",
+                "./dist/esm/server/mcp.js",
+                "./dist/cjs/server/mcp.js",
+            ])
+        );
+    }
+
+    #[test]
+    fn nested_conditions_without_match_fall_through() {
+        let exports = r#"{
+            "node": {"import": "./index.node.mjs"},
+            "default": "./index.js"
+        }"#;
+
+        assert_eq!(
+            resolve(exports, "", &["node", "require", "default"]),
+            paths(&["./index.js"])
+        );
+    }
+
+    #[test]
+    fn null_target_ends_search() {
+        // A null target as the first match excludes the subpath.
+        assert_eq!(
+            resolve(
+                r#"{"./internal/*": {"node": null, "default": "./internal/*.js"}}"#,
+                "internal/foo",
+                &["node", "default"]
+            ),
+            None
+        );
+
+        // A null target after a match drops the later fallbacks.
+        assert_eq!(
+            resolve(
+                r#"{"types": "./index.d.ts", "node": null, "default": "./index.js"}"#,
+                "",
+                &["types", "node", "default"]
+            ),
+            paths(&["./index.d.ts"])
         );
     }
 }
