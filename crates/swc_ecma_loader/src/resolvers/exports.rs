@@ -15,52 +15,58 @@ pub(super) struct Exports {
 impl Exports {
     /// Resolves a relative path to candidate target file paths, in priority order.
     /// The caller should use the first candidate that exists.
+    ///
+    /// As in Node and TypeScript, an exact key wins, and otherwise the most specific
+    /// matching pattern does. That entry alone decides the result: if it gives no
+    /// target, the path isn't exported and less specific patterns aren't tried.
     pub fn resolve_import_path(
         &self,
         rel_path: &str,
         conditions: &HashSet<&str>,
     ) -> Option<Vec<PathBuf>> {
-        let mut wildcard_match = None;
-        for (candidate, subpath) in self.subpaths.iter() {
-            match candidate_matches(candidate, rel_path) {
+        let mut best: Option<(&str, &Subpath, &str)> = None;
+        for (key, subpath) in self.subpaths.iter() {
+            match candidate_matches(key, rel_path) {
                 None => continue,
                 Some(Match::Exact) => {
-                    return subpath.matches(&conditions).and_then(|m| match m {
+                    return match subpath.matches(conditions)? {
                         SubpathMatch::Targets(paths) => {
                             Some(paths.into_iter().map(PathBuf::from).collect())
                         }
                         SubpathMatch::Exclude => None,
-                    });
+                    };
                 }
                 Some(Match::Wildcard { replacement }) => {
-                    match subpath.matches(&conditions) {
-                        None => continue,
-
-                        // If we have a target, save it as a candidate.
-                        // We have to keep looking as there may be an exclude directive later.
-                        Some(SubpathMatch::Targets(paths)) => {
-                            if wildcard_match.is_none() {
-                                wildcard_match = Some((paths, replacement));
-                            }
+                    let more_specific = match best {
+                        None => true,
+                        Some((best_key, ..)) => {
+                            pattern_specificity(key) > pattern_specificity(best_key)
                         }
-
-                        // If we have an exclude, stop looking and immediately return none.
-                        Some(SubpathMatch::Exclude) => return None,
+                    };
+                    if more_specific {
+                        best = Some((key, subpath, replacement));
                     }
                 }
             }
         }
 
-        match wildcard_match {
-            None => None,
-            Some((paths, replacement)) => Some(
+        let (_, subpath, replacement) = best?;
+        match subpath.matches(conditions)? {
+            SubpathMatch::Targets(paths) => Some(
                 paths
                     .into_iter()
-                    .map(|path| path.replace("*", replacement).into())
+                    .map(|path| path.replace('*', replacement).into())
                     .collect(),
             ),
+            SubpathMatch::Exclude => None,
         }
     }
+}
+
+/// Orders pattern keys like Node's PATTERN_KEY_COMPARE: a longer prefix before the
+/// "*" is more specific, then a longer key.
+fn pattern_specificity(key: &str) -> (usize, usize) {
+    (key.find('*').unwrap_or(key.len()), key.len())
 }
 
 enum Match<'a> {
@@ -86,7 +92,11 @@ fn candidate_matches<'a>(candidate: &str, rel_path: &'a str) -> Option<Match<'a>
         let (prefix, suffix) = candidate.split_at(idx);
         // Strip the "*" from the suffix.
         let suffix = &suffix[1..];
-        if rel_path.starts_with(prefix) && rel_path.ends_with(suffix) {
+        // The length check keeps the prefix and suffix from overlapping.
+        if rel_path.len() >= prefix.len() + suffix.len()
+            && rel_path.starts_with(prefix)
+            && rel_path.ends_with(suffix)
+        {
             // Get the middle part of the path, to be injected into the result.
             let replacement = &rel_path[prefix.len()..(rel_path.len() - suffix.len())];
             return Some(Match::Wildcard { replacement });
@@ -502,5 +512,56 @@ mod tests {
 
         // Only nulls under the active conditions: nothing to resolve.
         assert_eq!(resolve(r#"{"node": null}"#, "", &["node", "default"]), None);
+    }
+
+    #[test]
+    fn most_specific_pattern_wins() {
+        // As in Node and TypeScript, the most specific matching pattern decides the
+        // result, whatever its position in the object.
+        let conditions = &["node", "default"];
+        assert_eq!(
+            resolve(
+                r#"{"./*": "./dist/*.js", "./internal/*": "./internal/*.js"}"#,
+                "internal/foo",
+                conditions
+            ),
+            paths(&["./internal/foo.js"])
+        );
+
+        // A longer prefix before the "*" wins; with equal prefixes, the longer key.
+        assert_eq!(
+            resolve(
+                r#"{"./a/*": "./one/*", "./a/*.js": "./two/*.js"}"#,
+                "a/b.js",
+                conditions
+            ),
+            paths(&["./two/b.js"])
+        );
+
+        // If the most specific pattern resolves to nothing, the path isn't exported:
+        // less specific patterns aren't tried.
+        for exports in [
+            r#"{"./*": "./dist/*.js", "./internal/*": {"node": null}}"#,
+            r#"{"./internal/*": {"node": null}, "./*": "./dist/*.js"}"#,
+            r#"{"./*": "./dist/*.js", "./internal/*": {"browser": "./browser/*.js"}}"#,
+        ] {
+            assert_eq!(
+                resolve(exports, "internal/foo", conditions),
+                None,
+                "{exports}"
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_prefix_and_suffix_overlap() {
+        assert_eq!(
+            resolve(r#"{"./ab*bc": "./x/*.js"}"#, "abc", &["default"]),
+            None
+        );
+        assert_eq!(
+            resolve(r#"{"./ab*bc": "./x/*.js"}"#, "abxbc", &["default"]),
+            paths(&["./x/x.js"])
+        );
     }
 }
